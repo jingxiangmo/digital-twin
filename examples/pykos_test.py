@@ -32,20 +32,20 @@ class ZbotConfigs(RobotConfigs):
         "left_hip_yaw": 31,
         "left_hip_roll": 32,
         "left_hip_pitch": 33,
-        "left_knee_pitch": 34,
-        "left_ankle_pitch": 35,
+        "left_knee": 34,
+        "left_ankle": 35,
         # Right leg
         "right_hip_yaw": 41,
         "right_hip_roll": 42,
         "right_hip_pitch": 43,
-        "right_knee_pitch": 44,
-        "right_ankle_pitch": 45
+        "right_knee": 44,
+        "right_ankle": 45
     })
 
     signs: dict[str, float] = field(default_factory=lambda: {
         # Left arm
         "left_shoulder_yaw": 1,
-        "left_shoulder_pitch": -1,
+        "left_shoulder_pitch": 1,
         "left_elbow_yaw": -1,
         "left_gripper": 1,
         # Right arm
@@ -57,14 +57,14 @@ class ZbotConfigs(RobotConfigs):
         "left_hip_yaw": 1,
         "left_hip_roll": -1,
         "left_hip_pitch": 1,
-        "left_knee_pitch": 1,
-        "left_ankle_pitch": 1,
+        "left_knee": 1,
+        "left_ankle": 1,
         # Right leg
         "right_hip_yaw": 1,
         "right_hip_roll": 1,
         "right_hip_pitch": 1,
-        "right_knee_pitch": 1,
-        "right_ankle_pitch": 1
+        "right_knee": 1,
+        "right_ankle": 1
     })
 
 @dataclass
@@ -182,7 +182,7 @@ class KbotNakedConfigs(RobotConfigs):
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("mjcf_name", type=str, help="Name of the Mujoco model in the K-Scale API")
-    parser.add_argument("--ip", type=str, default="localhost", help="IP address of the robot")
+    parser.add_argument("--ip", type=str, default="192.168.42.1", help="IP address of the robot")
     args = parser.parse_args()
 
     configs: RobotConfigs
@@ -194,17 +194,84 @@ async def main() -> None:
         case _:
             raise ValueError(f"No configs for {args.mjcf_name}")
 
-    kos = KOS(ip=args.ip)
-    actor = PyKOSActor(kos, configs.joint_mapping, kos_signs=configs.signs)
-    actor.offset_in_place()
-    print(f"Offsets: {actor.get_offsets()}")
-    puppet = MujocoPuppet(args.mjcf_name)
+    async with KOS(ip=args.ip) as kos:
+        actor = PyKOSActor(kos, configs.joint_mapping, kos_signs=configs.signs)
+        await actor.offset_in_place()
 
-    while True:
-        joint_angles = await actor.get_joint_angles()
-        print(joint_angles)
-        await puppet.set_joint_angles(joint_angles)
-        await asyncio.sleep(0.01)
+        # Enable torque for all actuators (example)
+        for i in range(3):
+            for actuator_id in [11, 12, 13, 14, 21, 22, 23, 24, 31, 32, 33, 34, 35, 41, 42, 43, 44, 45]:
+                await kos.actuator.configure_actuator(actuator_id=actuator_id, torque_enabled=True)
+                await asyncio.sleep(0.1)
+
+        # Initialize all actuators to position 0 (example)
+        for actuator_id in actor.joint_ids:
+            await kos.actuator.command_actuators([{"actuator_id": actuator_id, "position": 0}])
+            await asyncio.sleep(0.1)
+
+        puppet = MujocoPuppet(args.mjcf_name)
+
+        # -------------------------------------
+        # Matplotlib setup for live bar chart
+        # -------------------------------------
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import math
+
+        plt.ion()  # Turn on interactive mode
+
+        # We'll treat the "actor.joint_ids" as the X-axis labels. 
+        # Or you could use the joint names if you prefer more descriptive labels.
+        x_labels = [str(jid) for jid in actor.joint_ids]
+        x_positions = np.arange(len(actor.joint_ids))
+
+        fig, ax = plt.subplots()
+        ax.set_title("Live Actuator Angles")
+        ax.set_xlabel("Actuator IDs")
+        ax.set_ylabel("Angle (degrees)")
+        ax.set_ylim([-180, 180])  # Adjust as needed
+
+        # Initialize the bar plot with zeros
+        bars = ax.bar(x_positions, [0]*len(actor.joint_ids), tick_label=x_labels)
+
+        # -------------------------------------
+        # Main loop
+        # -------------------------------------
+        while True:
+            # Get the latest joint angles (in radians)
+            joint_angles_rad = await actor.get_joint_angles()
+
+            # The dictionary keys are joint names; 
+            # we can map them to actuator IDs via actor.joint_ids or the config's joint_mapping.
+            # For each actuator ID, find the corresponding angle in radians, then convert to degrees.
+            # If you have a direct mapping from ID -> name, do that here; otherwise, adapt as needed.
+
+            angles_degrees = []
+            for actuator_id in actor.joint_ids:
+                # Find the joint name from the config's mapping
+                # (reverse lookup from 'configs.joint_mapping' if needed)
+                joint_name = None
+                for k, v in configs.joint_mapping.items():
+                    if v == actuator_id:
+                        joint_name = k
+                        break
+                # If a joint name was found, get that angle; otherwise, 0
+                if joint_name and joint_name in joint_angles_rad:
+                    angles_degrees.append(math.degrees(joint_angles_rad[joint_name]))
+                else:
+                    angles_degrees.append(0.0)
+
+            # Update the puppet (existing code)
+            await puppet.set_joint_angles(joint_angles_rad)
+
+            # Update the bar heights in the chart
+            for bar, new_height in zip(bars, angles_degrees):
+                bar.set_height(new_height)
+
+            plt.draw()
+            plt.pause(0.001)  # Allow matplotlib to update
+
+            await asyncio.sleep(0.01)
 
 
 if __name__ == "__main__":
