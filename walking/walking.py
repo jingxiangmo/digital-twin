@@ -12,7 +12,13 @@ class BipedController:
     and instead will call pykos to directly move actuators.
     """
 
-    def __init__(self):
+    def __init__(self, lateral_movement_enabled=True):
+        # Added parameter to control lateral movements
+        self.lateral_movement_enabled = lateral_movement_enabled
+
+        self.roll_offset = math.radians(-2)
+        self.hip_pitch_offset = math.radians(1)  # Added hip pitch forward offset (5°)
+
         # -----------
         # Gait params
         # -----------
@@ -38,7 +44,7 @@ class BipedController:
         self.accumulated_forward_offset = 0.0
         self.previous_stance_foot_offset = 0.0
         self.previous_swing_foot_offset = 0.0
-        self.step_length = 20.0
+        self.step_length = 15.0
 
         self.lateral_offset = 0.0
         self.dyi = 0.0
@@ -77,7 +83,7 @@ class BipedController:
             hip_roll = 0.0
         else:
             hip_roll = math.atan(y / h)
-        self.K1[side] = hip_roll
+        self.K1[side] = hip_roll + self.roll_offset
 
     def virtual_balance_adjustment(self):
         """
@@ -142,17 +148,19 @@ class BipedController:
                 self.gait_phase = 20
 
         elif self.gait_phase in [20, 30]:
-            # Main stepping logic
-            lateral_shift = self.lateral_foot_shift * math.sin(
-                math.pi * self.step_cycle_counter / self.step_cycle_length
-            )
-            if self.stance_foot_index == 0:
-                self.lateral_offset = lateral_shift
-            else:
-                self.lateral_offset = -lateral_shift
+            if self.lateral_movement_enabled:
+                lateral_shift = self.lateral_foot_shift * math.sin(
+                    math.pi * self.step_cycle_counter / self.step_cycle_length
+                )
+                if self.stance_foot_index == 0:
+                    self.lateral_offset = lateral_shift
+                else:
+                    self.lateral_offset = -lateral_shift
 
-            # Call virtual balance adjustment to modify lateral_offset if needed
-            self.virtual_balance_adjustment()
+                # Call virtual balance adjustment to modify lateral_offset if needed
+                self.virtual_balance_adjustment()
+            else:
+                self.lateral_offset = 0.0
 
             half_cycle = self.step_cycle_length / 2.0
             if self.step_cycle_counter < half_cycle:
@@ -249,12 +257,12 @@ class BipedController:
         angles["right_hip_yaw"] = 0.0
 
         angles["left_hip_roll"]  = self.K1[0]
-        angles["left_hip_pitch"] = -self.K0[0]
+        angles["left_hip_pitch"] = -self.K0[0] + -self.hip_pitch_offset
         angles["left_knee"]      = self.H[0]
         angles["left_ankle"]     = self.A0[0]
 
         angles["right_hip_roll"]  = self.K1[1]
-        angles["right_hip_pitch"] = self.K0[1]
+        angles["right_hip_pitch"] = self.K0[1] + self.hip_pitch_offset
         angles["right_knee"]      = -self.H[1]
         angles["right_ankle"]     = -self.A0[1]
 
@@ -336,10 +344,12 @@ async def main():
                         help="Name of the Mujoco model in the K-Scale API (optional).")
     parser.add_argument("--no-pykos", action="store_true",
                         help="Disable sending commands to PyKOS (simulation-only mode).")
+    parser.add_argument("--no-lateral", action="store_true",
+                        help="Disable lateral movements.")
     args = parser.parse_args()
 
-    # Create our biped controller
-    controller = BipedController()
+    # Create our biped controller with lateral movements disabled if --no-lateral is used
+    controller = BipedController(lateral_movement_enabled=not args.no_lateral)
 
     # If --mjcf_name is provided, set up a MujocoPuppet
     puppet = None
@@ -428,13 +438,13 @@ async def main():
                 angles_dict = controller.get_joint_angles()
                 commands = angles_to_pykos_commands(angles_dict)
                 # Instead of sending commands, we simply log them.
-                print("Simulated PyKOS command:", commands)
+                # print("Simulated PyKOS command:", commands)
                 if puppet is not None:
                     await puppet.set_joint_angles(angles_dict)
                 commands_sent += 1
                 current_time = time.time()
                 if current_time - start_time >= 1.0:
-                    print(f"Simulated Commands per second (CPS): {commands_sent}")
+                    # print(f"Simulated Commands per second (CPS): {commands_sent}")
                     commands_sent = 0
                     start_time = current_time
                 await asyncio.sleep(dt)
