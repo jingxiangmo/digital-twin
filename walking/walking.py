@@ -79,9 +79,48 @@ class BipedController:
             hip_roll = math.atan(y / h)
         self.K1[side] = hip_roll
 
+    def virtual_balance_adjustment(self):
+        """
+        Compute a virtual center-of-mass (CoM) based on the current foot positions,
+        and use a simple proportional feedback to adjust the lateral offset.
+        
+        For demonstration assumptions:
+          - The left foot (index 0) is computed as being at:
+              x: self.forward_offset[0] - self.hip_forward_offset
+              y: -self.lateral_offset + 1.0
+          - The right foot (index 1) is computed as being at:
+              x: self.forward_offset[1] - self.hip_forward_offset
+              y: self.lateral_offset + 1.0
+          
+        We assume the desired CoM (projected on the ground) should have a
+        lateral (y-axis) position of 1.0.
+        """
+        left_foot_x = self.forward_offset[0] - self.hip_forward_offset
+        left_foot_y = -self.lateral_offset + 1.0
+        right_foot_x = self.forward_offset[1] - self.hip_forward_offset
+        right_foot_y = self.lateral_offset + 1.0
+
+        # Compute estimated CoM as the average of the feet positions:
+        com_x = (left_foot_x + right_foot_x) / 2.0
+        com_y = (left_foot_y + right_foot_y) / 2.0
+
+        # Desired CoM lateral position (you can adjust this target based on your design)
+        desired_com_y = 1.0
+
+        # Compute the lateral error
+        error_y = desired_com_y - com_y
+
+        # Apply a proportional gain to adjust lateral offset; gain can be tuned in simulation.
+        feedback_gain = 0.1
+        adjustment = feedback_gain * error_y
+
+        # Update the lateral_offset value to help "steer" the CoM back toward desired position.
+        self.lateral_offset += adjustment
+
     def update_gait(self):
         """
         Update the internal state machine and foot positions each timestep.
+        Now incorporates a virtual balance adjustment loop using the kinematic model.
         """
         if self.gait_phase == 0:
             # Ramping down from initial_leg_height to nominal_leg_height
@@ -111,6 +150,9 @@ class BipedController:
                 self.lateral_offset = lateral_shift
             else:
                 self.lateral_offset = -lateral_shift
+
+            # Call virtual balance adjustment to modify lateral_offset if needed
+            self.virtual_balance_adjustment()
 
             half_cycle = self.step_cycle_length / 2.0
             if self.step_cycle_counter < half_cycle:
@@ -292,6 +334,8 @@ async def main():
                         help="IP for the KOS device, default=192.168.42.1")
     parser.add_argument("--mjcf_name", type=str, default="zbot-v2",
                         help="Name of the Mujoco model in the K-Scale API (optional).")
+    parser.add_argument("--no-pykos", action="store_true",
+                        help="Disable sending commands to PyKOS (simulation-only mode).")
     args = parser.parse_args()
 
     # Create our biped controller
@@ -302,72 +346,100 @@ async def main():
     if args.mjcf_name:
         puppet = MujocoPuppet(args.mjcf_name)
 
-    # Connect to KOS
-    async with KOS(ip=args.ip) as kos:
-        for actuator_id in joint_to_actuator_id.values():
-            print(f"Enabling torque for actuator {actuator_id}")
-            await kos.actuator.configure_actuator(actuator_id=actuator_id, kp=40, kd=30, torque_enabled=True)
+    dt = 0.001
 
-        # Optionally initialize to 0 position
-        for actuator_id in joint_to_actuator_id.values():
-            print(f"Setting actuator {actuator_id} to 0 position")
-            await kos.actuator.command_actuators([{"actuator_id": actuator_id, "position": 0}])
+    if not args.no_pykos:
+        # Connect to KOS and enable actuators
+        async with KOS(ip=args.ip) as kos:
+            for actuator_id in joint_to_actuator_id.values():
+                print(f"Enabling torque for actuator {actuator_id}")
+                await kos.actuator.configure_actuator(actuator_id=actuator_id, kp=32, kd=32, max_torque=80,
+                                                      torque_enabled=True)
 
-        # Countdown before starting movement
-        for i in range(5, 0, -1):
-            print(f"Starting in {i}...")
-            await asyncio.sleep(1)
+            # Optionally initialize to 0 position
+            for actuator_id in joint_to_actuator_id.values():
+                print(f"Setting actuator {actuator_id} to 0 position")
+                await kos.actuator.command_actuators([{"actuator_id": actuator_id, "position": 0}])
 
-        dt = 0.001
+            # Countdown before starting movement
+            for i in range(5, 0, -1):
+                print(f"Starting in {i}...")
+                await asyncio.sleep(1)
 
-        # ↓ Here we add the counters to measure commands per second
+            # Counters to measure commands per second
+            commands_sent = 0
+            start_time = time.time()
+            i = 0
+            try:
+                while True:
+                    if i >= 1000:
+                        i = 0
+                    i += 1
+                    # 1) Update the gait state machine
+                    start_time_gait = time.perf_counter()
+                    controller.update_gait()
+                    end_time_gait = time.perf_counter()
+                    gait_update_duration = end_time_gait - start_time_gait
+                    print(f"Gait update took {gait_update_duration * 1000:.3f} ms")
+
+                    # 2) Retrieve angles from the BipedController
+                    angles_dict = controller.get_joint_angles()
+
+                    # 3) Convert angles to PyKOS commands and send to the real robot
+                    commands = angles_to_pykos_commands(angles_dict)
+                    if commands:
+                        await kos.actuator.command_actuators(commands)
+
+                    # 4) Also send the same angles to MuJoCo puppet, if available
+                    # Uncomment below if you wish to update the puppet as well:
+                    # start_time_puppet = time.perf_counter()
+                    # if puppet is not None:
+                    #     await puppet.set_joint_angles(angles_dict)
+                    # end_time_puppet = time.perf_counter()
+                    # puppet_update_duration = end_time_puppet - start_time_puppet
+                    # print(f"Puppet update took {puppet_update_duration * 1000:.3f} ms")
+
+                    # Count how many loops (or 'commands sent') per second
+                    commands_sent += 1
+                    current_time = time.time()
+                    if current_time - start_time >= 1.0:
+                        print(f"Commands per second (CPS): {commands_sent}")
+                        commands_sent = 0
+                        start_time = current_time
+
+                    await asyncio.sleep(dt)
+            except KeyboardInterrupt:
+                print("\nShutting down gracefully.")
+                # Optionally disable torque at the end if desired
+                # for actuator_id in joint_to_actuator_id.values():
+                #     await kos.actuator.configure_actuator(actuator_id=actuator_id, torque_enabled=False)
+    else:
+        # Simulation-only mode; PyKOS commands are disabled.
+        print("Running in simulation-only mode (PyKOS commands are disabled).")
         commands_sent = 0
         start_time = time.time()
-
+        i = 0
         try:
             while True:
                 if i >= 1000:
                     i = 0
                 i += 1
-                # 1) Update the gait state machine
-                start_time_gait = time.perf_counter()
                 controller.update_gait()
-                end_time_gait = time.perf_counter()
-                gait_update_duration = end_time_gait - start_time_gait
-                print(f"Gait update took {gait_update_duration * 1000:.3f} ms")
-
-                # 2) Retrieve angles from the BipedController
                 angles_dict = controller.get_joint_angles()
-
-                # 3) Convert angles to PyKOS commands and send to the real robot
                 commands = angles_to_pykos_commands(angles_dict)
-                if commands:
-                    await kos.actuator.command_actuators(commands)
-
-                # 4) Also send the same angles to MuJoCo puppet, if available
-                # start_time_puppet = time.perf_counter()
-                # if puppet is not None:
-                #     await puppet.set_joint_angles(angles_dict)
-                # end_time_puppet = time.perf_counter()
-                # puppet_update_duration = end_time_puppet - start_time_puppet
-                # print(f"Puppet update took {puppet_update_duration * 1000:.3f} ms")
-
-                # Count how many loops (or 'commands sent') per second
+                # Instead of sending commands, we simply log them.
+                print("Simulated PyKOS command:", commands)
+                if puppet is not None:
+                    await puppet.set_joint_angles(angles_dict)
                 commands_sent += 1
                 current_time = time.time()
                 if current_time - start_time >= 1.0:
-                    print(f"Commands per second (CPS): {commands_sent}")
+                    print(f"Simulated Commands per second (CPS): {commands_sent}")
                     commands_sent = 0
                     start_time = current_time
-
-                await asyncio.sleep(dt + 0.00)
-                # await asyncio.sleep(dt)
-
+                await asyncio.sleep(dt)
         except KeyboardInterrupt:
             print("\nShutting down gracefully.")
-            # Optionally disable torque at the end if desired
-            # for actuator_id in joint_to_actuator_id.values():
-            #     await kos.actuator.configure_actuator(actuator_id=actuator_id, torque_enabled=False)
 
 
 if __name__ == "__main__":
